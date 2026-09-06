@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -<b>- coding: utf-8 -</b>-
+# -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    JokyHost — Telegram Bot                       ║
@@ -20,7 +20,6 @@ import html
 import re
 import time
 import threading
-import ssl
 import math
 import uuid
 import aiohttp
@@ -32,12 +31,10 @@ from pytz import timezone
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.types import TelegramObject
-from collections import defaultdict
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     WebAppInfo, InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
-    ChosenInlineResult
 )
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -132,9 +129,10 @@ YOOMONEY_TOKEN  = os.getenv("YOOMONEY_TOKEN", "")
 YOOMONEY_SECRET = os.getenv("YOOMONEY_SECRET", "")  # notification_secret из настроек приложения
 YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "4100119099824546")
 
-# Локальный API-сервер для AI-диагностики логов (как в akari.py)
-LOCAL_API_URL   = os.getenv("LOCAL_API_URL",   "http://localhost:9998")
-LOCAL_API_TOKEN = os.getenv("LOCAL_API_TOKEN", "pomogator_groq_proxy_secret_token_2024")
+# AI-провайдер (OpenAI-совместимый API nixai) для JokyAI и диагностики логов
+# POST {LOCAL_API_URL}/v1/chat/completions, Authorization: Bearer <token>
+LOCAL_API_URL   = os.getenv("LOCAL_API_URL",   "https://api.nixai.ru").rstrip("/")
+LOCAL_API_TOKEN = os.getenv("LOCAL_API_TOKEN", "N-735d57557efa2f45b11ac73ad79e080a")
 LOCAL_API_MODEL = os.getenv("LOCAL_API_MODEL", "gpt-4o")
 
 AUTH_DOMAIN      = os.getenv("AUTH_DOMAIN", "ub.theluni.ru")
@@ -167,6 +165,35 @@ log = logging.getLogger("jokyhost")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 app = Flask(__name__)
+
+# Главный event loop бота (устанавливается в main()). Нужен, чтобы из потока
+# Flask безопасно вызывать корутины бота (bot.send_message и т.п.).
+_BOT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _run_async(coro, timeout: Optional[float] = 600):
+    """
+    Синхронно выполнить корутину из потока Flask.
+    Если главный loop бота запущен — выполняем в нём (run_coroutine_threadsafe):
+    aiohttp-сессия aiogram привязана к этому loop и падает в чужом.
+    Иначе — во временном loop, который гарантированно закрывается (без утечки).
+    """
+    loop = _BOT_LOOP
+    if loop is not None and loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return fut.result(timeout=timeout)
+        except BaseException:
+            fut.cancel()
+            raise
+    tmp = asyncio.new_event_loop()
+    try:
+        return tmp.run_until_complete(coro)
+    finally:
+        try:
+            tmp.run_until_complete(tmp.shutdown_asyncgens())
+        finally:
+            tmp.close()
 
 pending_creation: Dict[int, dict] = {}
 pending_telethon: Dict[int, dict] = {}
@@ -642,6 +669,21 @@ def get_pending_payments():
         return conn.execute("""
             SELECT * FROM payments WHERE status = 'pending' ORDER BY created_at DESC
         """).fetchall()
+
+def payment_already_credited(marker: str) -> bool:
+    """
+    Был ли уже зачислен платёж с данным маркером (например 'yoomoney:<label>').
+    Маркер хранится в поле screenshot_path. Защита от двойного зачисления
+    при повторном нажатии «Проверить оплату» или повторной доставке webhook.
+    """
+    if not marker:
+        return False
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM payments WHERE screenshot_path = ? AND status = 'approved' LIMIT 1",
+            (marker,)
+        ).fetchone()
+        return row is not None
 
 def approve_payment(payment_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as conn:
@@ -1267,7 +1309,7 @@ def create_user_dockerfile(user_dir: Path, user_id: int):
     dockerfile = user_dir / "Dockerfile"
     setup_py = user_dir / "setup.py"
 
-    dockerfile.write_text(f"""FROM ubuntu:22.04
+    dockerfile.write_text("""FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -1421,7 +1463,7 @@ def patch_heroku_entity(repo_dir: Path):
             content = content.replace(old, new)
             import re as _re
             content = _re.sub(
-                r'while True:.<b>?Sleeping 10 seconds\.\.\."[^\n]</b>\n\s*await asyncio\.sleep\(10\)',
+                r'while True:.*?Sleeping 10 seconds\.\.\."[^\n]*\n\s*await asyncio\.sleep\(10\)',
                 'return None',
                 content,
                 flags=_re.DOTALL
@@ -1628,7 +1670,7 @@ async def docker_create(user_id: int, status_cb=None) -> Tuple[bool, str]:
         forums_ok, forums_msg = await setup_heroku_forums(user_id)
         if forums_ok:
             log.info(f"setup_heroku_forums OK for {user_id}: {forums_msg}")
-            await status(f"✅ Группа создана!")
+            await status("✅ Группа создана!")
         else:
             log.warning(f"setup_heroku_forums FAILED for {user_id}: {forums_msg}")
             await status(f"⚠️ Группа не создана: {forums_msg}")
@@ -1803,41 +1845,55 @@ async def _local_request(
     timeout: int = 45,
 ) -> Optional[str]:
     """
-    Запрос к локальному OpenAI-совместимому серверу (как в akari.py).
+    Запрос к OpenAI-совместимому API (nixai): POST /v1/chat/completions
+    с заголовком Authorization: Bearer <token>.
     Системный промпт передаётся первым сообщением с role=system.
     Возвращает текст ответа или None при ошибке.
     """
     full_messages = [{"role": "system", "content": system}] + messages
+    url = f"{LOCAL_API_URL}/v1/chat/completions"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{LOCAL_API_URL}/v1/chat/completions",
+                url,
                 headers={
                     "Authorization": f"Bearer {LOCAL_API_TOKEN}",
                     "Content-Type": "application/json",
                 },
                 json={
                     "model": LOCAL_API_MODEL,
-                    "max_tokens": max_tokens,
                     "messages": full_messages,
+                    "max_tokens": max_tokens,
+                    "stream": False,
                 },
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    log.error(f"Local AI API {resp.status}: {err[:200]}")
+                    log.error(f"AI API {resp.status} ({url}): {err[:300]}")
                     return None
-                data = await resp.json()
-        # Поддержка стандартного OpenAI-формата
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"].strip()
-        # Поддержка кастомного формата {"success": True, "response": "..."}
-        if "response" in data:
-            return data["response"].strip()
+                data = await resp.json(content_type=None)
+        # Стандартный OpenAI-формат: {"choices": [{"message": {"content": "..."}}]}
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if choices:
+            msg = choices[0].get("message") or {}
+            content = msg.get("content") or choices[0].get("text") or ""
+            if content.strip():
+                return content.strip()
+        # Ошибка в теле ответа: {"error": {"message": "..."}}
+        if isinstance(data, dict) and data.get("error"):
+            log.error(f"AI API error: {str(data['error'])[:300]}")
+            return None
+        # Кастомный формат {"success": True, "response": "..."}
+        if isinstance(data, dict) and data.get("response"):
+            return str(data["response"]).strip()
         log.error(f"_local_request unexpected format: {str(data)[:200]}")
         return None
+    except asyncio.TimeoutError:
+        log.error(f"_local_request timeout after {timeout}s ({url})")
+        return None
     except Exception as e:
-        log.error(f"_local_request error: {e}")
+        log.error(f"_local_request error: {type(e).__name__}: {e}")
         return None
 
 
@@ -1873,7 +1929,7 @@ def ai_clear_history(uid: int):
 
 async def ai_analyze_logs(logs: str) -> dict:
     """
-    Отправляет логи в локальную модель и получает диагноз + инструкцию через кнопки бота.
+    Отправляет логи в AI (nixai) и получает диагноз + инструкцию через кнопки бота.
     Возвращает dict:
       {
         "critical": bool,
@@ -1893,15 +1949,28 @@ async def ai_analyze_logs(logs: str) -> dict:
         return {"critical": False, "summary": "Ошибка запроса к AI.", "solution": "", "fix_cmd": None}
 
     try:
-        clean = re.sub(r"^```json|^```|```$", "", raw_text, flags=re.MULTILINE).strip()
-        result = json.loads(clean)
+        clean = re.sub(r"^```(?:json)?\s*|```\s*$", "", raw_text.strip(), flags=re.MULTILINE).strip()
+        try:
+            result = json.loads(clean)
+        except json.JSONDecodeError:
+            # Модель могла добавить текст вокруг JSON — вырезаем первый {...} блок
+            start, end = clean.find("{"), clean.rfind("}")
+            if start == -1 or end <= start:
+                raise
+            result = json.loads(clean[start:end + 1])
+        if not isinstance(result, dict):
+            raise ValueError("JSON is not an object")
         for k, default in [("critical", False), ("summary", ""), ("solution", ""), ("fix_cmd", None)]:
             result.setdefault(k, default)
+        result["critical"] = bool(result["critical"])
+        result["summary"]  = str(result["summary"] or "")
+        result["solution"] = str(result["solution"] or "")
         result["fix_cmd"] = None  # Принудительно — никогда не выполняем команды
         return result
     except Exception as e:
         log.error(f"ai_analyze_logs parse error: {e}, raw: {raw_text[:300]}")
-        return {"critical": False, "summary": f"Ошибка разбора ответа AI: {e}", "solution": "", "fix_cmd": None}
+        # Показываем пользователю сам ответ модели, а не техническую ошибку
+        return {"critical": False, "summary": raw_text[:800], "solution": "", "fix_cmd": None}
 
 
 async def ai_execute_fix(user_id: int, fix_cmd: str) -> tuple:
@@ -2244,6 +2313,8 @@ HTML_WEBAPP = """<!DOCTYPE html>
   --blue:#60a5fa;--blue-d:rgba(96,165,250,.1);
   --purple:#a78bfa;--purple-d:rgba(167,139,250,.1);
   --sidebar:220px;
+  /* алиасы — использовались в стилях, но не были объявлены */
+  --border:var(--brd2);--card-bg:var(--bg3);--grn:var(--green);--amb:var(--amber);
 }
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
@@ -4101,7 +4172,6 @@ def flask_qr_check():
 @require_webapp_auth
 def flask_dashboard():
     """Возвращает данные для дашборда: свой сервер + список шаринг-серверов."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     if not tg_id:
@@ -4116,10 +4186,8 @@ def flask_dashboard():
     stats = {}
     if has_server:
         try:
-            loop = _aio.new_event_loop()
-            container_status = loop.run_until_complete(docker_container_status(tg_id))
-            stats = loop.run_until_complete(docker_container_stats(tg_id))
-            loop.close()
+            container_status = _run_async(docker_container_status(tg_id), timeout=60)
+            stats = _run_async(docker_container_stats(tg_id), timeout=60)
         except Exception:
             pass
 
@@ -4132,9 +4200,7 @@ def flask_dashboard():
         cs = "unknown"
         if oh:
             try:
-                loop2 = _aio.new_event_loop()
-                cs = loop2.run_until_complete(docker_container_status(owner_id))
-                loop2.close()
+                cs = _run_async(docker_container_status(owner_id), timeout=60)
             except Exception:
                 pass
         shared_list.append({
@@ -4167,7 +4233,6 @@ def flask_dashboard():
 @require_webapp_auth
 def flask_server_action():
     """Выполняет действие start/stop/restart на сервере."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     target_id = data.get("target_id")
@@ -4189,19 +4254,17 @@ def flask_server_action():
             return jsonify({"success": False, "message": "Нет доступа к серверу"})
 
     try:
-        loop = _aio.new_event_loop()
         if action_val == "start":
-            ok = loop.run_until_complete(docker_start(target_id))
+            ok = _run_async(docker_start(target_id), timeout=120)
             msg = "Сервер запущен" if ok else "Ошибка запуска"
         elif action_val == "stop":
-            ok = loop.run_until_complete(docker_stop(target_id))
+            ok = _run_async(docker_stop(target_id), timeout=120)
             msg = "Сервер остановлен" if ok else "Ошибка остановки"
         elif action_val == "restart":
-            ok = loop.run_until_complete(docker_restart(target_id))
+            ok = _run_async(docker_restart(target_id), timeout=120)
             msg = "Сервер перезапущен" if ok else "Ошибка перезапуска"
         else:
             return jsonify({"success": False, "message": "Неизвестное действие"})
-        loop.close()
         return jsonify({"success": ok, "message": msg})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -4211,7 +4274,6 @@ def flask_server_action():
 @require_webapp_auth
 def flask_server_logs():
     """Возвращает реальные логи Docker-контейнера."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     target_id = data.get("target_id")
@@ -4231,9 +4293,7 @@ def flask_server_logs():
             return jsonify({"success": False, "message": "Нет доступа к серверу"})
 
     try:
-        loop = _aio.new_event_loop()
-        logs = loop.run_until_complete(docker_logs(target_id, lines=60))
-        loop.close()
+        logs = _run_async(docker_logs(target_id, lines=60), timeout=90)
         return jsonify({"success": True, "logs": logs})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -4243,7 +4303,6 @@ def flask_server_logs():
 @require_webapp_auth
 def flask_terminal():
     """Выполняет команду в docker-контейнере пользователя."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     target_id = data.get("target_id")
@@ -4287,9 +4346,7 @@ def flask_terminal():
             return "⏱ Timeout (>30 сек)", -1
 
     try:
-        loop = _aio.new_event_loop()
-        output, rc = loop.run_until_complete(_run())
-        loop.close()
+        output, rc = _run_async(_run(), timeout=60)
         return jsonify({"success": True, "output": output[:4000] or "(нет вывода)", "rc": rc})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -4299,7 +4356,6 @@ def flask_terminal():
 @require_webapp_auth
 def flask_delete_server():
     """Полное удаление сервера пользователя."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     if not tg_id:
@@ -4308,9 +4364,7 @@ def flask_delete_server():
     if not user_has_hosting(tg_id):
         return jsonify({"success": False, "message": "Сервер не найден"})
     try:
-        loop = _aio.new_event_loop()
-        ok, msg = loop.run_until_complete(docker_delete(tg_id, keep_files=False, delete_all_files=True))
-        loop.close()
+        ok, msg = _run_async(docker_delete(tg_id, keep_files=False, delete_all_files=True), timeout=180)
         return jsonify({"success": ok, "message": msg})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -4320,7 +4374,6 @@ def flask_delete_server():
 @require_webapp_auth
 def flask_reinstall_server():
     """Переустановка сервера (сохраняет порт, дату, файлы ID/)."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     if not tg_id:
@@ -4351,9 +4404,7 @@ def flask_reinstall_server():
         return ok, result
 
     try:
-        loop = _aio.new_event_loop()
-        ok, result = loop.run_until_complete(_reinstall())
-        loop.close()
+        ok, result = _run_async(_reinstall(), timeout=900)
         if ok:
             h = get_hosting(tg_id)
             return jsonify({"success": True, "port": h["port"] if h else result, "expires_at": h["expires_at"] if h else old_exp})
@@ -4366,7 +4417,6 @@ def flask_reinstall_server():
 @require_webapp_auth
 def flask_ai_diagnose():
     """AI-диагностика логов через LOCAL_API."""
-    import asyncio as _aio
     data = request.get_json() or {}
     tg_id = getattr(request, "verified_user_id", None) or data.get("user_id")
     target_id = data.get("target_id")
@@ -4386,10 +4436,8 @@ def flask_ai_diagnose():
             return jsonify({"success": False, "message": "Нет доступа к серверу"})
 
     try:
-        loop = _aio.new_event_loop()
-        logs = loop.run_until_complete(docker_logs(target_id, lines=60))
-        diagnosis = loop.run_until_complete(ai_analyze_logs(logs))
-        loop.close()
+        logs = _run_async(docker_logs(target_id, lines=60), timeout=90)
+        diagnosis = _run_async(ai_analyze_logs(logs), timeout=120)
         return jsonify({"success": True, **diagnosis})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -4420,7 +4468,6 @@ _YOOMONEY_IPS = {"77.75.153.234", "77.75.156.11", "77.75.156.35", "77.75.154.128
 @app.route("/yoomoney/notify", methods=["POST"])
 def yoomoney_notify():
     """Webhook от ЮMани — автоматическое зачисление баланса."""
-    import asyncio as _aio
     params = request.form.to_dict()
 
     # Проверяем IP отправителя
@@ -4450,17 +4497,15 @@ def yoomoney_notify():
         log.info(f"YooMoney notify: no valid label (uid), amount={amount}")
         # Уведомляем админа для ручного зачисления
         try:
-            loop = _aio.new_event_loop()
-            loop.run_until_complete(bot.send_message(
+            _run_async(bot.send_message(
                 ADMIN_ID,
                 f"💳 <b>ЮMани платёж без label</b>\n\n"
                 f"Сумма: <b>{amount} ₽</b>\n"
-                f"Отправитель: {params.get('sender', '—')}\n"
-                f"ID операции: {params.get('operation_id', '—')}\n\n"
+                f"Отправитель: {html.escape(str(params.get('sender', '—')))}\n"
+                f"ID операции: {html.escape(str(params.get('operation_id', '—')))}\n\n"
                 f"⚠️ Зачислите вручную.",
                 parse_mode="HTML"
-            ))
-            loop.close()
+            ), timeout=60)
         except Exception as e:
             log.error(f"YooMoney notify: failed to notify admin: {e}")
         return "ok", 200
@@ -4472,23 +4517,25 @@ def yoomoney_notify():
     if not u:
         log.warning(f"YooMoney notify: user {user_id} not found")
         try:
-            loop = _aio.new_event_loop()
-            loop.run_until_complete(bot.send_message(
+            _run_async(bot.send_message(
                 ADMIN_ID,
                 f"💳 <b>ЮMани платёж — неизвестный пользователь</b>\n\n"
                 f"UID: <code>{user_id}</code>\n"
                 f"Сумма: <b>{amount} ₽</b>\n"
-                f"ID операции: {params.get('operation_id', '—')}",
+                f"ID операции: {html.escape(str(params.get('operation_id', '—')))}",
                 parse_mode="HTML"
-            ))
-            loop.close()
+            ), timeout=60)
         except Exception:
             pass
         return "ok", 200
 
-    # Зачисляем баланс
+    # Зачисляем баланс (с защитой от повторной доставки уведомления)
     operation_id = params.get("operation_id", "")
-    pay_id = create_payment(user_id, amount, 0, f"yoomoney:{operation_id}")
+    marker = f"yoomoney:{operation_id}" if operation_id else ""
+    if marker and payment_already_credited(marker):
+        log.info(f"YooMoney notify: operation {operation_id} already credited, skip")
+        return "ok", 200
+    pay_id = create_payment(user_id, amount, 0, marker)
     approve_payment(pay_id)
     add_balance(user_id, amount)
 
@@ -4496,31 +4543,27 @@ def yoomoney_notify():
 
     # Уведомляем пользователя
     try:
-        loop = _aio.new_event_loop()
-        loop.run_until_complete(bot.send_message(
+        _run_async(bot.send_message(
             user_id,
             f"✅ <b>Баланс пополнен!</b>\n\n"
             f"<blockquote>💰 Зачислено: <b>{amount} ₽</b>\n"
             f"💎 Новый баланс: <b>{get_balance(user_id)} ₽</b></blockquote>",
             parse_mode="HTML",
             reply_markup=back_kb()
-        ))
-        loop.close()
+        ), timeout=60)
     except Exception as e:
         log.error(f"YooMoney notify: failed to notify user {user_id}: {e}")
 
     # Уведомляем админа
     try:
-        loop2 = _aio.new_event_loop()
-        loop2.run_until_complete(bot.send_message(
+        _run_async(bot.send_message(
             ADMIN_ID,
             f"💳 <b>ЮMани — авто-зачисление</b>\n\n"
             f"👤 UID: <code>{user_id}</code>\n"
             f"💰 Сумма: <b>{amount} ₽</b>\n"
-            f"🔑 Операция: <code>{operation_id}</code>",
+            f"🔑 Операция: <code>{html.escape(str(operation_id))}</code>",
             parse_mode="HTML"
-        ))
-        loop2.close()
+        ), timeout=60)
     except Exception:
         pass
 
@@ -4576,7 +4619,7 @@ async def cmd_start(msg: Message):
             pass
 
     if uid == ADMIN_ID:
-        safe_name = msg.from_user.first_name or "Администратор"
+        safe_name = html.escape(msg.from_user.first_name or "Администратор")
         h = get_hosting(uid)
         status_line = ""
         if h:
@@ -4615,7 +4658,7 @@ async def cmd_start(msg: Message):
             except Exception:
                 pass
 
-        first_name = msg.from_user.first_name or "пользователь"
+        first_name = html.escape(msg.from_user.first_name or "пользователь")
         await msg.answer(
             f"👋 С возвращением, <b>{first_name}!</b>\n\n"
             f"<blockquote>⚡️ JokyHost — хостинг для вашего юзербота.{status_line}</blockquote>\n\n"
@@ -4742,7 +4785,7 @@ async def cb_my_hosting(cq: CallbackQuery):
             f"├ 💾 RAM: <code>{stats.get('mem', '—')}</code> ({stats.get('mem_p', '—')})\n"
         )
     else:
-        stats_lines = f"├ ⚙️ Лимиты: 1 CPU · 650 MB RAM\n"
+        stats_lines = "├ ⚙️ Лимиты: 1 CPU · 650 MB RAM\n"
 
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="my_hosting")
@@ -4889,7 +4932,7 @@ async def cb_container_terminal(cq: CallbackQuery, state: FSMContext):
         "Введите команду для выполнения внутри вашего контейнера:\n\n"
         "Примеры:\n"
         "• <code>ls /app</code>\n"
-        "• `cat /app/config.json`\n"
+        "• <code>cat /app/config.json</code>\n"
         "• <code>ps aux</code>\n\n"
         "⚠️ Команда выполнится с правами контейнера.",
         parse_mode=ParseMode.HTML,
@@ -5191,7 +5234,7 @@ async def relogin_get_api_hash(msg: Message, state: FSMContext):
 
     if not success:
         await msg.answer(
-            f"❌ Ошибка сохранения конфига:\n`{config_result}`\n\n"
+            f"❌ Ошибка сохранения конфига:\n<code>{html.escape(str(config_result))}</code>\n\n"
             "Попробуйте позже или обратитесь к администратору.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("menu")
@@ -5538,7 +5581,7 @@ async def cb_finance_menu(cq: CallbackQuery):
     uid = cq.from_user.id
     bal = get_balance(uid)
     h = get_hosting(uid)
-    sub_line = f"\n📅 Подписка до: `{h['expires_at']}`" if h else ""
+    sub_line = f"\n📅 Подписка до: <code>{h['expires_at']}</code>" if h else ""
     await cq.message.edit_text(
         f"💎 <b>Кошелёк и оплата</b>\n\n"
         f"<blockquote>💰 Баланс: <b>{bal} ₽</b>{sub_line}</blockquote>\n\n"
@@ -5557,7 +5600,7 @@ async def cb_my_balance(cq: CallbackQuery):
     text = f"💎 <b>Мой кошелёк</b>\n\n<blockquote>💰 Баланс: <b>{bal} ₽</b>\n"
     if h:
         text += f"\n📅 Подписка до: <code>{h['expires_at']}</code>"
-    text += f"</blockquote>\n\n💳 Пополнить — через кнопку ниже."
+    text += "</blockquote>\n\n💳 Пополнить — через кнопку ниже."
 
     b = InlineKeyboardBuilder()
     b.button(text="💳 Пополнить", callback_data="topup_menu")
@@ -5624,7 +5667,6 @@ async def _show_payment_screen(target_msg, state: FSMContext, amount: int, label
     """Генерирует уникальную ЮMани-ссылку и показывает экран оплаты."""
     chat_id = target_msg.chat.id if hasattr(target_msg, 'chat') else 0
     total = ym_total(amount)
-    commission = total - amount
 
     # Генерируем уникальную ссылку с uuid label для автопроверки
     try:
@@ -5698,8 +5740,20 @@ async def cb_ym_check(cq: CallbackQuery, state: FSMContext):
     )
 
     if paid:
+        marker = f"yoomoney:{ym_label}"
+        if payment_already_credited(marker):
+            # Уже зачислено ранее (повторное нажатие) — не начисляем второй раз
+            await state.clear()
+            await cq.message.edit_text(
+                f"✅ <b>Этот платёж уже зачислен</b>\n\n"
+                f"<blockquote>💎 Баланс: <b>{get_balance(uid)} ₽</b>\n"
+                f"🔑 ID: <code>{ym_label[:8]}…</code></blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_kb("finance_menu"),
+            )
+            return
         # Создаём и авто-апрувим платёж
-        pay_id = create_payment(uid, amount, 0, f"yoomoney:{ym_label}")
+        pay_id = create_payment(uid, amount, 0, marker)
         approve_payment(pay_id)
         add_balance(uid, amount)
         new_balance = get_balance(uid)
@@ -5730,7 +5784,7 @@ async def cb_ym_check(cq: CallbackQuery, state: FSMContext):
             await bot.send_message(
                 ADMIN_ID,
                 f"💳 <b>Автопополнение ЮMани</b>\n\n"
-                f"👤 {user.full_name} ({uname})\n"
+                f"👤 {html.escape(user.full_name or '—')} ({uname})\n"
                 f"🆔 <code>{uid}</code>\n"
                 f"💰 Сумма: <b>{amount} ₽</b>\n"
                 f"💎 Баланс: <b>{new_balance} ₽</b>",
@@ -6045,7 +6099,7 @@ async def cb_payment_history(cq: CallbackQuery):
     lines = []
     for p in pays:
         icon, label = status_map.get(p["status"], ("❓", p["status"]))
-        date = p["created_at"][:10] if p.get("created_at") else "—"
+        date = p["created_at"][:10] if p["created_at"] else "—"
         lines.append(
             f"{icon} <code>{date}</code>  <b>{p['amount']} ₽</b>  <i>{label}</i>"
         )
@@ -6053,10 +6107,10 @@ async def cb_payment_history(cq: CallbackQuery):
     total_paid = sum(p["amount"] for p in pays if p["status"] == "approved")
 
     text = (
-        f"╔══ 📜 <b>ИСТОРИЯ ПЛАТЕЖЕЙ</b> ══╗\n\n"
-        f"<blockquote>"
+        "╔══ 📜 <b>ИСТОРИЯ ПЛАТЕЖЕЙ</b> ══╗\n\n"
+        "<blockquote>"
         + "\n".join(lines) +
-        f"\n\n━━━━━━━━━━━━━━━━━━\n"
+        "\n\n━━━━━━━━━━━━━━━━━━\n"
         f"💎 Всего пополнено: <b>{total_paid} ₽</b>"
         f"</blockquote>"
     )
@@ -6166,7 +6220,7 @@ async def cb_extend_months(cq: CallbackQuery, state: FSMContext):
         f"┌ 📅 Период: <b>{months} мес. ({months * 30} дн.)</b>\n"
         f"├ 💸 Спишется: <b>{amount} ₽</b>\n"
         f"├ 💰 Остаток: <b>{bal - amount} ₽</b>\n"
-        f"└ 📅 Новый срок до: `{new_exp}`\n\n"
+        f"└ 📅 Новый срок до: <code>{new_exp}</code>\n\n"
         "Подтвердить?",
         parse_mode=ParseMode.HTML,
         reply_markup=b.as_markup()
@@ -6292,7 +6346,7 @@ async def handler_extend_days(msg: Message, state: FSMContext):
                 f"┌ 📅 Период: <b>{days} дн.</b>\n"
                 f"├ 💸 Спишется: <b>{amount} ₽</b>\n"
                 f"├ 💰 Остаток: <b>{bal - amount} ₽</b>\n"
-                f"└ 📅 Новый срок до: `{new_exp}`\n\n"
+                f"└ 📅 Новый срок до: <code>{new_exp}</code>\n\n"
                 "Подтвердить?",
                 chat_id=msg.chat.id, message_id=extend_msg_id,
                 parse_mode=ParseMode.HTML,
@@ -6410,7 +6464,7 @@ async def cb_stars_selected(cq: CallbackQuery, state: FSMContext):
         f"Ваша оценка: <b>{stars} ⭐</b>\n\n"
         f"Теперь напишите ваш отзыв о сервисе JokyHost.\n\n"
         f"💬 Отправьте текст в чат:\n\n"
-        f"_Ваше сообщение будет удалено после отправки на модерацию._",
+        "<i>Ваше сообщение будет удалено после отправки на модерацию.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb.as_markup()
     )
@@ -6467,7 +6521,7 @@ async def review_text_handler(msg: Message, state: FSMContext):
     # Отправляем администратору
     admin_caption = (
         f"✍️ <b>Новый отзыв на модерации</b>\n\n"
-        f"┌ 👤 ID: `{user.id}`\n"
+        f"┌ 👤 ID: <code>{user.id}</code>\n"
         f"├ 📛 Имя: {safe_name}\n"
         f"├ 👤 @{user.username or 'нет'}\n"
         f"├ ⭐ Оценка: <b>{stars}/5</b>\n"
@@ -6735,7 +6789,7 @@ async def cb_adm_srv_panel(cq: CallbackQuery):
     container_status = await docker_container_status(target_uid)
     status_text = fmt_status(container_status)
     await cq.message.edit_text(
-        f"🖥 <b>Сервер пользователя</b> `{target_uid}`\n\n"
+        f"🖥 <b>Сервер пользователя</b> <code>{target_uid}</code>\n\n"
         f"├ 🔌 Порт: <code>{h['port']}</code>\n"
         f"├ 📅 До: <code>{h['expires_at']}</code>\n"
         f"└ 🐳 Статус: {status_text}\n\n"
@@ -6752,7 +6806,7 @@ async def cb_adm_srv_start(cq: CallbackQuery):
     await cq.answer("▶️ Запускаем...")
     ok = await docker_start(uid)
     await cq.message.edit_text(
-        f"{'▶️ Сервер `' + str(uid) + '<code> запущен!' if ok else '❌ Ошибка запуска </code>' + str(uid) + '`'}",
+        f"▶️ Сервер <code>{uid}</code> запущен!" if ok else f"❌ Ошибка запуска <code>{uid}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_server_manage_kb(uid)
     )
@@ -6764,7 +6818,7 @@ async def cb_adm_srv_stop(cq: CallbackQuery):
     await cq.answer("⏹ Останавливаем...")
     ok = await docker_stop(uid)
     await cq.message.edit_text(
-        f"{'⏹ Сервер `' + str(uid) + '` остановлен.' if ok else '❌ Ошибка остановки `' + str(uid) + '`'}",
+        f"⏹ Сервер <code>{uid}</code> остановлен." if ok else f"❌ Ошибка остановки <code>{uid}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_server_manage_kb(uid)
     )
@@ -6776,7 +6830,7 @@ async def cb_adm_srv_restart(cq: CallbackQuery):
     await cq.answer("🔁 Перезапускаем...")
     ok = await docker_restart(uid)
     await cq.message.edit_text(
-        f"{'🔁 Сервер `' + str(uid) + '<code> перезапущен!' if ok else '❌ Ошибка рестарта </code>' + str(uid) + '`'}",
+        f"🔁 Сервер <code>{uid}</code> перезапущен!" if ok else f"❌ Ошибка рестарта <code>{uid}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_server_manage_kb(uid)
     )
@@ -6795,7 +6849,7 @@ async def cb_adm_srv_logs(cq: CallbackQuery):
     b.button(text="◀️ Назад",    callback_data=f"adm_srv_panel_{uid}")
     b.adjust(1)
     await cq.message.edit_text(
-        f"📋 <b>Логи</b> `{uid}` <b>(40 строк)</b>\n\n<pre>{truncated}</pre>",
+        f"📋 <b>Логи</b> <code>{uid}</code> <b>(40 строк)</b>\n\n<pre>{truncated}</pre>",
         parse_mode=ParseMode.HTML,
         reply_markup=b.as_markup()
     )
@@ -6829,13 +6883,13 @@ async def handler_add_balance_uid(msg: Message, state: FSMContext):
         await state.set_state(AdminStates.add_balance_amount)
         try:
             await bot.edit_message_text(
-                f"➕ <b>Начисление баланса</b>\n\nПользователь: `{uid}`\n\nВведите сумму начисления (₽):",
+                f"➕ <b>Начисление баланса</b>\n\nПользователь: <code>{uid}</code>\n\nВведите сумму начисления (₽):",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
         except Exception:
             sent = await msg.answer(
-                f"➕ <b>Начисление баланса</b>\n\nПользователь: `{uid}`\n\nВведите сумму (₽):",
+                f"➕ <b>Начисление баланса</b>\n\nПользователь: <code>{uid}</code>\n\nВведите сумму (₽):",
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
             await state.update_data(step_msg_id=sent.message_id, step_chat_id=msg.chat.id)
@@ -6885,7 +6939,7 @@ async def handler_add_balance_amount(msg: Message, state: FSMContext):
     except ValueError:
         try:
             await bot.edit_message_text(
-                f"➕ <b>Начисление баланса</b>\n\nПользователь: `{data.get('target_uid')}`\n\n❌ Введите числовую сумму (₽):",
+                f"➕ <b>Начисление баланса</b>\n\nПользователь: <code>{data.get('target_uid')}</code>\n\n❌ Введите числовую сумму (₽):",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
@@ -6921,14 +6975,14 @@ async def handler_force_sub_uid(msg: Message, state: FSMContext):
         await state.set_state(AdminStates.force_sub_expires)
         try:
             await bot.edit_message_text(
-                f"🔧 <b>Выдать подписку</b>\n\nПользователь: `{uid}`\n\n"
+                f"🔧 <b>Выдать подписку</b>\n\nПользователь: <code>{uid}</code>\n\n"
                 "Введите дату истечения (<code>ГГГГ-ММ-ДД</code>):\nПример: <code>2025-12-31</code>",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
         except Exception:
             sent = await msg.answer(
-                f"🔧 <b>Выдать подписку</b>\n\nПользователь: `{uid}`\n\nВведите дату (<code>ГГГГ-ММ-ДД</code>):",
+                f"🔧 <b>Выдать подписку</b>\n\nПользователь: <code>{uid}</code>\n\nВведите дату (<code>ГГГГ-ММ-ДД</code>):",
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
             await state.update_data(step_msg_id=sent.message_id, step_chat_id=msg.chat.id)
@@ -6970,14 +7024,14 @@ async def handler_force_sub_expires(msg: Message, state: FSMContext):
         await state.clear()
         try:
             await bot.edit_message_text(
-                f"✅ Подписка выдана пользователю `{uid}<code> до </code>{expires}`.\n"
+                f"✅ Подписка выдана пользователю <code>{uid}</code> до <code>{expires}</code>.\n"
                 f"ℹ️ Сервер нужно создать отдельно через бота.",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=admin_kb()
             )
         except Exception:
             await msg.answer(
-                f"✅ Подписка выдана пользователю `{uid}<code> до </code>{expires}`.",
+                f"✅ Подписка выдана пользователю <code>{uid}</code> до <code>{expires}</code>.",
                 parse_mode=ParseMode.HTML, reply_markup=admin_kb()
             )
         try:
@@ -6991,7 +7045,7 @@ async def handler_force_sub_expires(msg: Message, state: FSMContext):
     except ValueError:
         try:
             await bot.edit_message_text(
-                f"🔧 <b>Выдать подписку</b>\n\nПользователь: `{data.get('force_uid')}`\n\n"
+                f"🔧 <b>Выдать подписку</b>\n\nПользователь: <code>{data.get('force_uid')}</code>\n\n"
                 "❌ Неверный формат. Используйте <code>ГГГГ-ММ-ДД</code>:",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
@@ -7039,14 +7093,14 @@ async def handler_change_expiry_uid(msg: Message, state: FSMContext):
         await state.set_state(AdminStates.change_expiry_date)
         try:
             await bot.edit_message_text(
-                f"📅 <b>Изменение срока подписки</b>\n\nПользователь: `{uid}`\n"
-                f"Текущая дата: `{h['expires_at']}`\n\nВведите новую дату (<code>ГГГГ-ММ-ДД</code>):",
+                f"📅 <b>Изменение срока подписки</b>\n\nПользователь: <code>{uid}</code>\n"
+                f"Текущая дата: <code>{h['expires_at']}</code>\n\nВведите новую дату (<code>ГГГГ-ММ-ДД</code>):",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
             )
         except Exception:
             sent = await msg.answer(
-                f"Текущая дата: `{h['expires_at']}`\n\nВведите новую дату (<code>ГГГГ-ММ-ДД</code>):",
+                f"Текущая дата: <code>{h['expires_at']}</code>\n\nВведите новую дату (<code>ГГГГ-ММ-ДД</code>):",
                 parse_mode=ParseMode.HTML
             )
             await state.update_data(step_msg_id=sent.message_id, step_chat_id=msg.chat.id)
@@ -7078,13 +7132,13 @@ async def handler_change_expiry_date(msg: Message, state: FSMContext):
         await state.clear()
         try:
             await bot.edit_message_text(
-                f"✅ Срок пользователя `{uid}<code> изменён на </code>{new_date}`.",
+                f"✅ Срок пользователя <code>{uid}</code> изменён на <code>{new_date}</code>.",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=admin_kb()
             )
         except Exception:
             await msg.answer(
-                f"✅ Срок пользователя `{uid}<code> изменён на </code>{new_date}`.",
+                f"✅ Срок пользователя <code>{uid}</code> изменён на <code>{new_date}</code>.",
                 parse_mode=ParseMode.HTML, reply_markup=admin_kb()
             )
         try:
@@ -7096,7 +7150,7 @@ async def handler_change_expiry_date(msg: Message, state: FSMContext):
     except ValueError:
         try:
             await bot.edit_message_text(
-                f"📅 <b>Изменение срока подписки</b>\n\nПользователь: `{uid}`\n\n"
+                f"📅 <b>Изменение срока подписки</b>\n\nПользователь: <code>{uid}</code>\n\n"
                 "❌ Неверный формат. Используйте <code>ГГГГ-ММ-ДД</code>:",
                 chat_id=step_chat_id, message_id=step_msg_id,
                 parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel")
@@ -7110,7 +7164,7 @@ async def cb_admin_broadcast(cq: CallbackQuery, state: FSMContext):
         await cq.answer("❌ Нет доступа", show_alert=True)
         return
     step_msg = await cq.message.edit_text(
-        "📢 <b>Рассылка</b>\n\nВведите текст сообщения (поддерживается Markdown):",
+        "📢 <b>Рассылка</b>\n\nВведите текст сообщения.\n<i>Форматирование Telegram (жирный, курсив, ссылки) сохранится.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=back_kb("admin_panel")
     )
@@ -7123,12 +7177,18 @@ async def handler_broadcast(msg: Message, state: FSMContext):
     data = await state.get_data()
     step_msg_id = data.get("step_msg_id")
     step_chat_id = data.get("step_chat_id", msg.chat.id)
-    broadcast_text = msg.text or ""
+    try:
+        broadcast_text = msg.html_text if (msg.text or msg.caption) else ""
+    except Exception:
+        broadcast_text = html.escape(msg.text or "")
     try:
         await msg.delete()
     except Exception:
         pass
     await state.clear()
+    if not broadcast_text.strip():
+        await msg.answer("❌ Пустой текст рассылки.", reply_markup=admin_kb())
+        return
 
     try:
         await bot.edit_message_text(
@@ -7214,14 +7274,14 @@ async def handler_annihilate_uid(msg: Message, state: FSMContext):
     user_info = ""
     if user_row:
         uname = f"@{user_row['username']}" if user_row['username'] else "нет"
-        fname = user_row['full_name'] or "—"
+        fname = html.escape(user_row['full_name'] or "—")
         bal   = user_row['balance']
         user_info += f"👤 <b>{fname}</b> ({uname})\n💰 Баланс: {bal} ₽\n"
     else:
         user_info += "👤 Пользователь <b>не найден в БД</b>\n"
 
     if hosting_row:
-        user_info += f"🖥 Сервер: порт `{hosting_row['port']}<code>, до </code>{hosting_row['expires_at']}`\n"
+        user_info += f"🖥 Сервер: порт <code>{hosting_row['port']}</code>, до <code>{hosting_row['expires_at']}</code>\n"
     else:
         user_info += "🖥 Сервер: <b>нет</b>\n"
 
@@ -7236,7 +7296,7 @@ async def handler_annihilate_uid(msg: Message, state: FSMContext):
     try:
         await bot.edit_message_text(
             f"☢️ <b>Аннигиляция</b> — подтверждение\n\n"
-            f"ID: `{target_uid}`\n"
+            f"ID: <code>{target_uid}</code>\n"
             f"{user_info}\n"
             f"❗️ Все данные будут уничтожены. Продолжить?",
             chat_id=step_chat_id, message_id=step_msg_id,
@@ -7246,7 +7306,7 @@ async def handler_annihilate_uid(msg: Message, state: FSMContext):
     except Exception:
         sent = await msg.answer(
             f"☢️ <b>Аннигиляция</b> — подтверждение\n\n"
-            f"ID: `{target_uid}`\n"
+            f"ID: <code>{target_uid}</code>\n"
             f"{user_info}\n"
             f"❗️ Все данные будут уничтожены. Продолжить?",
             parse_mode=ParseMode.HTML,
@@ -7295,14 +7355,14 @@ async def cb_annihilate_confirm(cq: CallbackQuery, state: FSMContext):
     try:
         await cq.message.edit_text(
             f"☢️ <b>Аннигиляция завершена</b>\n\n"
-            f"ID: `{target_uid}`\n\n"
+            f"ID: <code>{target_uid}</code>\n\n"
             f"{result_text}",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("admin_panel")
         )
     except Exception:
         await cq.message.answer(
-            f"☢️ <b>Аннигиляция завершена</b>\n\nID: `{target_uid}`\n\n{result_text}",
+            f"☢️ <b>Аннигиляция завершена</b>\n\nID: <code>{target_uid}</code>\n\n{result_text}",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("admin_panel")
         )
@@ -7351,7 +7411,7 @@ async def cb_admin_refresh_status(cq: CallbackQuery):
         )
     except Exception as e:
         await cq.message.edit_text(
-            f"❌ <b>Ошибка обновления</b>\n\n`{e}`",
+            f"❌ <b>Ошибка обновления</b>\n\n<code>{html.escape(str(e))}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=back_kb("admin_panel")
         )
@@ -7393,7 +7453,7 @@ async def cb_sharing_list(cq: CallbackQuery):
         return
     lines = []
     for row in shared:
-        lines.append(f"• `{row['shared_uid']}` (с {row['created_at'][:10]})")
+        lines.append(f"• <code>{row['shared_uid']}</code> (с {row['created_at'][:10]})")
     await cq.message.edit_text(
         "👥 <b>Пользователи с доступом к вашему серверу:</b>\n\n<blockquote>" + "\n".join(lines) + "</blockquote>",
         parse_mode=ParseMode.HTML,
@@ -7456,7 +7516,7 @@ async def sharing_get_uid_to_add(msg: Message, state: FSMContext):
             b.button(text="◀️ Назад", callback_data="sharing_menu")
             await edit_step(
                 f"➕ <b>Шаринг-панель — Выдать доступ</b>\n\n"
-                f"ℹ️ Пользователь `{target_uid}` уже имеет доступ к вашему серверу.",
+                f"ℹ️ Пользователь <code>{target_uid}</code> уже имеет доступ к вашему серверу.",
                 kb=b.as_markup(), clear_state=True
             )
             return
@@ -7465,7 +7525,7 @@ async def sharing_get_uid_to_add(msg: Message, state: FSMContext):
         b.button(text="◀️ Назад в Шаринг-панель", callback_data="sharing_menu")
         await edit_step(
             f"✅ <b>Доступ выдан!</b>\n\n"
-            f"Пользователь `{target_uid}` теперь может управлять вашим сервером.",
+            f"Пользователь <code>{target_uid}</code> теперь может управлять вашим сервером.",
             kb=b.as_markup(), clear_state=True
         )
         try:
@@ -7498,7 +7558,7 @@ async def cb_sharing_remove(cq: CallbackQuery, state: FSMContext):
         await cq.answer("📭 Нет активных доступов для отзыва", show_alert=True)
         return
     await state.set_state(SharingStates.waiting_uid_to_remove)
-    lines = "\n".join([f"• `{r['shared_uid']}`" for r in shared])
+    lines = "\n".join([f"• <code>{r['shared_uid']}</code>" for r in shared])
     step_msg = await cq.message.edit_text(
         f"➖ <b>Шаринг-панель — Отозвать доступ</b>\n\n"
         f"Пользователи с текущим доступом:\n{lines}\n\n"
@@ -7538,10 +7598,10 @@ async def sharing_get_uid_to_remove(msg: Message, state: FSMContext):
         if not has_shared_access(owner_id, target_uid):
             # Показываем актуальный список и просим ввести снова
             shared = get_shared_users(owner_id)
-            lines = "\n".join([f"• `{r['shared_uid']}`" for r in shared]) if shared else "_(список пуст)_"
+            lines = "\n".join([f"• <code>{r['shared_uid']}</code>" for r in shared]) if shared else "<i>(список пуст)</i>"
             await edit_step(
                 f"➖ <b>Шаринг-панель — Отозвать доступ</b>\n\n"
-                f"❌ У пользователя `{target_uid}` нет доступа к вашему серверу.\n\n"
+                f"❌ У пользователя <code>{target_uid}</code> нет доступа к вашему серверу.\n\n"
                 f"Пользователи с доступом:\n{lines}\n\n"
                 "Введите корректный ID:",
                 clear_state=not bool(shared)
@@ -7552,7 +7612,7 @@ async def sharing_get_uid_to_remove(msg: Message, state: FSMContext):
         b.button(text="◀️ Назад в Шаринг-панель", callback_data="sharing_menu")
         await edit_step(
             f"✅ <b>Доступ отозван!</b>\n\n"
-            f"Пользователь `{target_uid}` больше не имеет доступа к вашему серверу.",
+            f"Пользователь <code>{target_uid}</code> больше не имеет доступа к вашему серверу.",
             kb=b.as_markup(), clear_state=True
         )
         try:
@@ -7603,7 +7663,7 @@ async def cb_shared_manage(cq: CallbackQuery):
     container_status = await docker_container_status(owner_id)
     status_text = fmt_status(container_status)
     await cq.message.edit_text(
-        f"🖥 *Шаринг-панель — Сервер #{owner_id}*\n\n"
+        f"🖥 <b>Шаринг-панель — Сервер #{owner_id}</b>\n\n"
         f"├ 🔌 Порт: <code>{h['port']}</code>\n"
         f"└ 🐳 Статус: {status_text}\n\n"
         "Доступные действия:",
@@ -7670,7 +7730,7 @@ async def cb_shared_logs(cq: CallbackQuery):
     b.button(text="◀️ Назад",    callback_data=f"shared_manage_{owner_id}")
     b.adjust(1)
     await cq.message.edit_text(
-        f"📋 *Шаринг-панель — Логи сервера #{owner_id}* (30 строк)\n\n<pre>{truncated}</pre>",
+        f"📋 <b>Шаринг-панель — Логи сервера #{owner_id}</b> (30 строк)\n\n<pre>{truncated}</pre>",
         parse_mode=ParseMode.HTML,
         reply_markup=b.as_markup()
     )
@@ -7685,7 +7745,7 @@ async def cb_sharing_accept(cq: CallbackQuery):
         return
     await cq.message.edit_text(
         f"✅ <b>Доступ принят!</b>\n\n"
-        f"Теперь вы можете управлять сервером `#{owner_id}` через «🤝 Шаринг-панель» → «🔗 Чужие серверы».",
+        f"Теперь вы можете управлять сервером <code>#{owner_id}</code> через «🤝 Шаринг-панель» → «🔗 Чужие серверы».",
         parse_mode=ParseMode.HTML,
         reply_markup=back_kb("sharing_menu")
     )
@@ -7693,7 +7753,7 @@ async def cb_sharing_accept(cq: CallbackQuery):
     try:
         await bot.send_message(
             owner_id,
-            f"✅ <b>Шаринг-панель</b>\n\nПользователь `{uid}` принял доступ к вашему серверу.",
+            f"✅ <b>Шаринг-панель</b>\n\nПользователь <code>{uid}</code> принял доступ к вашему серверу.",
             parse_mode=ParseMode.HTML
         )
     except Exception:
@@ -7707,7 +7767,7 @@ async def cb_sharing_decline(cq: CallbackQuery):
     owner_id = int(cq.data.split("_")[2])
     remove_shared_access(owner_id, uid)
     await cq.message.edit_text(
-        f"🚫 <b>Доступ отклонён.</b>\n\nВы отклонили приглашение от `{owner_id}`.",
+        f"🚫 <b>Доступ отклонён.</b>\n\nВы отклонили приглашение от <code>{owner_id}</code>.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_kb("menu")
     )
@@ -7754,7 +7814,7 @@ async def cb_sharing_leave(cq: CallbackQuery):
         return
     remove_shared_access(owner_id, uid)
     await cq.message.edit_text(
-        f"✅ <b>Отключено!</b>\n\nВы успешно отключились от сервера `#{owner_id}`.",
+        f"✅ <b>Отключено!</b>\n\nВы успешно отключились от сервера <code>#{owner_id}</code>.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_kb("sharing_menu")
     )
@@ -7819,6 +7879,11 @@ async def inline_query_handler(query: InlineQuery):
                 )
             )]
         else:
+            # callback_data ограничен 64 байтами — обрезаем команду по байтам UTF-8
+            cb_prefix = f"iexec_{uid}_"
+            cmd_bytes = cmd_text.encode("utf-8")[: max(0, 64 - len(cb_prefix.encode("utf-8")))]
+            cmd_for_cb = cmd_bytes.decode("utf-8", errors="ignore")
+            truncated_note = "" if cmd_for_cb == cmd_text else "\n⚠️ Команда слишком длинная — будет выполнена обрезанной."
             results = [InlineQueryResultArticle(
                 id=f"iexec_{abs(hash(cmd_text + str(uid))) % 999999}",
                 title="💻 Выполнить в контейнере",
@@ -7826,15 +7891,15 @@ async def inline_query_handler(query: InlineQuery):
                 input_message_content=InputTextMessageContent(
                     message_text=(
                         f"💻 <b>Терминал — контейнер <code>user_{uid}</code></b>\n\n"
-                        f"<code>$ {cmd_text}</code>\n\n"
-                        f"⏳ Нажмите кнопку для выполнения..."
+                        f"<code>$ {html.escape(cmd_for_cb)}</code>\n\n"
+                        f"⏳ Нажмите кнопку для выполнения...{truncated_note}"
                     ),
                     parse_mode=ParseMode.HTML
                 ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(
                         text="▶️ Выполнить",
-                        callback_data=f"iexec_{uid}_{cmd_text[:55]}"
+                        callback_data=cb_prefix + cmd_for_cb
                     )
                 ]])
             )]
@@ -8059,7 +8124,7 @@ async def cb_inline_exec(cq: CallbackQuery):
     rc_icon = "✅" if rc == 0 else "❌"
     new_text = (
         f"💻 <b>Терминал — <code>{container_name}</code></b>\n\n"
-        f"<b>Команда:</b> <code>{cmd_text}</code>\n"
+        f"<b>Команда:</b> <code>{html.escape(cmd_text)}</code>\n"
         f"<b>Статус:</b> {rc_icon} код <code>{rc}</code>\n\n"
         f"<b>Вывод:</b>\n<pre>{output_safe}</pre>"
     )
@@ -8243,12 +8308,13 @@ async def cb_inline_action(cq: CallbackQuery):
             inline_message_id=inline_msg_id,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"iaction_restart_{uid}")
+                InlineKeyboardButton(text="📊 Статус сервера", callback_data=f"iaction_sub_{uid}")
             ]])
         )
     except Exception as e:
         log.error(f"iaction edit failed: {e}")
-        await cq.answer(result_text.replace("*", ""), show_alert=True)
+        # В alert HTML не поддерживается — убираем теги
+        await cq.answer(re.sub(r"<[^>]+>", "", result_text), show_alert=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -8354,6 +8420,9 @@ async def main():
     print(f"  📢  Канал: {CHANNEL_REQUIRED}")
     print(f"  🔐  Auth: https://{AUTH_DOMAIN}:{AUTH_PORT}")
     print("=" * 60)
+
+    global _BOT_LOOP
+    _BOT_LOOP = asyncio.get_running_loop()
 
     BASE_USERS_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
